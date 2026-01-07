@@ -1,0 +1,95 @@
+diff --git a/test/functional/rescan_benchmark.py b/test/functional/rescan_benchmark.py
+new file mode 100755
+index 0000000000..1821584edf
+--- /dev/null
++++ b/test/functional/rescan_benchmark.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++
++import time
++
++CHAIN_HEIGHT = 40000
++INTERVALS = [0, 500, 1000, 2000, 10000, CHAIN_HEIGHT+1] # For interval CHAIN_HEIGHT+1, there will be no payments in the chain
++
++class RescanBenchmark(BitcoinTestFramework):
++    def add_options(self, parser):
++        parser.add_argument('--output_file', dest='output_file', default='', help='File to write benchmark results to')
++
++    def set_test_params(self):
++        self.num_nodes = len(INTERVALS)
++        self.setup_clean_chain = True
++
++    def skip_test_if_missing_module(self):
++        self.skip_if_no_wallet()
++
++    ### Returns (min, max, avg)
++    def benchmark(self, wallet, iters: int = 3) -> (int, int, int):
++        min_time = float('inf')
++        max_time = 0
++        total_time = 0
++
++        for _ in range(iters):
++            start_time = time.perf_counter_ns()
++            wallet.rescanblockchain(0, CHAIN_HEIGHT)
++            end_time = time.perf_counter_ns()
++
++            elapsed = end_time - start_time
++            min_time = min(min_time, elapsed)
++            max_time = max(max_time, elapsed)
++            total_time += elapsed
++
++        avg_time = total_time // iters
++        return min_time, max_time, avg_time
++
++    def generate_chain(self, node, address, interval: int):
++        while node.getblockcount() < CHAIN_HEIGHT:
++            self.generate(node, max(0, min(interval-1, CHAIN_HEIGHT)), sync_fun=self.no_op)
++            if node.getblockcount() >= CHAIN_HEIGHT:
++                break
++            self.generatetoaddress(node, 1, address, sync_fun=self.no_op)
++
++    def run_test(self):
++        # Disconnect nodes to prevent block relay
++        for i in range(self.num_nodes - 1):
++            self.disconnect_nodes(i, i+1)
++
++        results = []
++        for i, interval in enumerate(INTERVALS):
++            node = self.nodes[i]
++            node.createwallet(wallet_name='rescan_benchmark')
++            wallet = node.get_wallet_rpc('rescan_benchmark')
++            address = wallet.getnewaddress()
++            self.log.info(f"Benchmarking rescanblockchain with interval {interval}")
++            self.generate_chain(node, address, interval)
++            assert_equal(node.getblockcount(), CHAIN_HEIGHT)
++            assert_equal(len(wallet.listtransactions("*", CHAIN_HEIGHT)), CHAIN_HEIGHT // max(1, interval) if interval <= CHAIN_HEIGHT else 0)
++
++            for type in ['Fast', 'Slow']:
++                if type == 'Fast':
++                    self.restart_node(i, ['-blockfilterindex=1'])
++                else:
++                    self.restart_node(i, ['-blockfilterindex=0'])
++    
++                node.loadwallet('rescan_benchmark')
++                wallet = node.get_wallet_rpc('rescan_benchmark')
++                min_time, max_time, avg_time = self.benchmark(wallet)
++                results.append((type, interval, min_time, max_time, avg_time))
++                self.log.info(f"{type} Rescan Results for interval {interval}: min={min_time}ns, max={max_time}ns, avg={avg_time}ns")
++
++        # Write to output file specified in args
++        output_file = self.options.output_file
++        if output_file:
++            with open(output_file, 'w') as f:
++                f.write("Type,Interval,Min Time (us),Max Time (us),Avg Time (us)\n")
++                for type, interval, min_time, max_time, avg_time in results:
++                    f.write(f"{type},{interval},{min_time // 1000},{max_time // 1000},{avg_time // 1000}\n")
++            self.log.info(f"Benchmark results written to {output_file}")
++        else:
++            self.log.info("No output file specified, skipping write.")
++
++
++if __name__ == '__main__':
++    RescanBenchmark(__file__).main()
