@@ -79,10 +79,10 @@ for thread_idx, thread_count in enumerate(threads):
     for commit in commits:
         commit_data = slow_df[slow_df['Commit'] == commit]
         if len(commit_data) > 0:
-            commit_data = commit_data.sort_values('Interval')
+            commit_data = commit_data.sort_values('Interval').copy()
             # Replace interval 0 with 1 for log scale plotting
-            x_values = commit_data['Interval'].replace(0, 1)
-            ax_slow.plot(x_values, commit_data['Avg Time (us)'] / 1000,
+            commit_data.loc[commit_data['Interval'] == 0, 'Interval'] = 1
+            ax_slow.plot(commit_data['Interval'], commit_data['Avg Time (us)'] / 1000,
                         marker='o', label=commit, color=commit_colors[commit],
                         linewidth=2, markersize=8)
 
@@ -94,6 +94,11 @@ for thread_idx, thread_count in enumerate(threads):
     ax_slow.grid(True, alpha=0.3)
     ax_slow.set_xscale('log')
     ax_slow.set_yscale('log')
+
+    # Set the same y-axis limits for both Fast and Slow plots
+    max_y = max(thread_df['Avg Time (us)'].max() / 1000, 1)
+    ax_fast.set_ylim(top=max_y)
+    ax_slow.set_ylim(top=max_y)
 
 plt.tight_layout()
 plt.savefig('benchmark_comparison.png', dpi=300, bbox_inches='tight')
