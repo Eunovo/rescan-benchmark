@@ -67,6 +67,13 @@ for COMMIT in "$@"; do
 
     # Build the project
     echo "Building project..."
+    if ! cmake -B build -DENABLE_WALLET=ON -DCMAKE_BUILD_TYPE=Release; then
+        echo "Error: CMake configuration failed for $COMMIT, skipping..."
+        if [ -n "$PATCH_FILE" ]; then
+            git apply --reverse "$PATCH_FILE"
+        fi
+        continue
+    fi
     if ! cmake --build build -j$(nproc); then
         echo "Error: Build failed for $COMMIT, skipping..."
         if [ -n "$PATCH_FILE" ]; then
