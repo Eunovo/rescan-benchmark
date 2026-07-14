@@ -1,40 +1,53 @@
 diff --git a/test/functional/rescan_benchmark.py b/test/functional/rescan_benchmark.py
 new file mode 100755
-index 0000000000..4a2dec85af
+index 0000000000..049044b1f3
 --- /dev/null
 +++ b/test/functional/rescan_benchmark.py
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,173 @@
 +#!/usr/bin/env python3
 +
++from test_framework.address import address_to_scriptpubkey
++from test_framework.blocktools import create_block, create_coinbase
++from test_framework.messages import CBlockHeader, CTxOut, msg_block, msg_headers
++from test_framework.p2p import P2PInterface
 +from test_framework.test_framework import BitcoinTestFramework
 +from test_framework.util import assert_equal
 +
 +import time
 +
-+CHAIN_HEIGHT = 20000
-+INTERVALS = [0, 5, 500, 1000, 2000, 10000, CHAIN_HEIGHT+1] # For interval CHAIN_HEIGHT+1, there will be no payments in the chain
++CHAIN_LENGTH = 20000
++INTERVALS = [0, 5, 500, 1000, 2000, 10000, CHAIN_LENGTH+1] # For interval CHAIN_LENGTH+1, there will be no payments in the chain
 +THREADS = [1, 2, 4, 8, 16]
++
++# Blocks are announced/submitted to the node in batches over p2p.
++BATCH_SIZE = 2000
++
++class BaseNode(P2PInterface):
++    def send_header_for_blocks(self, new_blocks):
++        headers_message = msg_headers()
++        headers_message.headers = [CBlockHeader(b) for b in new_blocks]
++        self.send_without_ping(headers_message)
 +
 +class RescanBenchmark(BitcoinTestFramework):
 +    def add_options(self, parser):
 +        parser.add_argument('--output_file', dest='output_file', default='', help='File to write benchmark results to')
 +
 +    def set_test_params(self):
-+        self.num_nodes = len(INTERVALS)
++        self.num_nodes = 1
 +        self.setup_clean_chain = True
 +
 +    def skip_test_if_missing_module(self):
 +        self.skip_if_no_wallet()
 +
 +    ### Returns (min, max, avg)
-+    def benchmark(self, wallet, iters: int = 3) -> (int, int, int):
++    def benchmark(self, wallet, stop_height, iters: int = 3) -> (int, int, int):
 +        min_time = float('inf')
 +        max_time = 0
 +        total_time = 0
 +
 +        for _ in range(iters):
 +            start_time = time.perf_counter_ns()
-+            wallet.rescanblockchain(0, CHAIN_HEIGHT)
++            wallet.rescanblockchain(0, stop_height)
 +            end_time = time.perf_counter_ns()
 +
 +            elapsed = end_time - start_time
@@ -45,41 +58,108 @@ index 0000000000..4a2dec85af
 +        avg_time = total_time // iters
 +        return min_time, max_time, avg_time
 +
-+    def generate_chain(self, node, address, interval: int):
-+        while node.getblockcount() < CHAIN_HEIGHT:
-+            self.generate(node, max(0, min(interval-1, CHAIN_HEIGHT)), sync_fun=self.no_op)
-+            if node.getblockcount() >= CHAIN_HEIGHT:
-+                break
-+            self.generatetoaddress(node, 1, address, sync_fun=self.no_op)
++    ### Number of blocks between payments for a given interval (interval 0 means every block)
++    def payment_step(self, interval: int) -> int:
++        return interval if interval > 0 else 1
++
++    ### Number of payments an interval's address should have received in the built chain
++    def expected_payment_count(self, interval: int) -> int:
++        return CHAIN_LENGTH // self.payment_step(interval) if interval <= CHAIN_LENGTH else 0
++
++    ### Asserts the wallet has recorded exactly the expected number of payments for the interval
++    def assert_payments_received(self, wallet, address, interval):
++        expected = self.expected_payment_count(interval)
++        # include_immature_coinbase=True since the payments are coinbase outputs and most
++        # of the chain is still within COINBASE_MATURITY of the tip.
++        received = wallet.listreceivedbyaddress(0, True, False, address, True)
++        actual = len(received[0]['txids']) if received else 0
++        assert_equal(actual, expected)
++
++    ### Builds a single chain of blocks in-process, where each interval's address is paid
++    ### (via an extra zero-value coinbase output) every `interval` blocks.
++    def build_chain(self, tip, block_time, interval_scripts):
++        blocks = []
++        for height in range(1, CHAIN_LENGTH + 1):
++            coinbase = create_coinbase(height)
++            for interval, script in interval_scripts.items():
++                if interval <= CHAIN_LENGTH and height % self.payment_step(interval) == 0:
++                    coinbase.vout.append(CTxOut(0, script))
++            block = create_block(tip, coinbase, ntime=block_time)
++            block.solve()
++            blocks.append(block)
++            tip = block.hash_int
++            block_time += 1
++        return blocks
++
++    ### Submits pre-built blocks to the node over p2p, announcing headers in batches first.
++    def submit_chain(self, node, blocks):
++        p2p = node.add_p2p_connection(BaseNode())
++        for i in range(0, len(blocks), BATCH_SIZE):
++            p2p.send_header_for_blocks(blocks[i:i + BATCH_SIZE])
++        for block in blocks:
++            p2p.send_without_ping(msg_block(block))
++        p2p.sync_with_ping(timeout=960)
++        node.disconnect_p2ps()
 +
 +    def run_test(self):
-+        # Disconnect nodes to prevent block relay
-+        for i in range(self.num_nodes - 1):
-+            self.disconnect_nodes(i, i+1)
++        node = self.nodes[0]
++        self.restart_node(0, ['-blockfilterindex=1'])
++
++        node.createwallet(wallet_name='keys')
++        keys = node.get_wallet_rpc('keys')
++        interval_addresses = {}
++        interval_descriptors = {}
++        for interval in INTERVALS:
++            address = keys.getnewaddress()
++            interval_addresses[interval] = address
++            interval_descriptors[interval] = keys.getaddressinfo(address)['desc']
++        interval_scripts = {interval: address_to_scriptpubkey(address) for interval, address in interval_addresses.items()}
++
++        self.log.info("Building chain blocks in-process")
++        tip = int(node.getbestblockhash(), 16)
++        block_time = node.getblock(node.getbestblockhash())['time'] + 1
++        blocks = self.build_chain(tip, block_time, interval_scripts)
++
++        self.log.info("Submitting chain to the node over p2p")
++        self.submit_chain(node, blocks)
++        assert_equal(node.getblockcount(), CHAIN_LENGTH)
++
++        # Blocks submitted over p2p aren't picked up by the wallet's live notifications,
++        # so rescan explicitly to check the chain was built correctly.
++        keys.rescanblockchain(0, CHAIN_LENGTH)
++        for interval, address in interval_addresses.items():
++            self.assert_payments_received(keys, address, interval)
++
++        node.unloadwallet('keys')
++
++        # Create one watch-only wallet per interval, each holding only that interval's key.
++        for interval in INTERVALS:
++            wallet_name = f'rescan_{interval}'
++            node.createwallet(wallet_name=wallet_name, disable_private_keys=True, blank=True, descriptors=True)
++            import_result = node.get_wallet_rpc(wallet_name).importdescriptors([{
++                'desc': interval_descriptors[interval],
++                'timestamp': 'now',
++            }])
++            assert_equal(import_result[0]['success'], True)
++            node.unloadwallet(wallet_name)
 +
 +        results = []
-+        for i, interval in enumerate(INTERVALS):
-+            node = self.nodes[i]
-+            self.restart_node(i, ['-blockfilterindex=1'])
-+            node.createwallet(wallet_name='rescan_benchmark')
-+            wallet = node.get_wallet_rpc('rescan_benchmark')
-+            address = wallet.getnewaddress()
++        for interval in INTERVALS:
++            wallet_name = f'rescan_{interval}'
 +            self.log.info(f"Benchmarking rescanblockchain with interval {interval}")
-+            self.generate_chain(node, address, interval)
-+            assert_equal(node.getblockcount(), CHAIN_HEIGHT)
-+            assert_equal(len(wallet.listtransactions("*", CHAIN_HEIGHT)), CHAIN_HEIGHT // max(1, interval) if interval <= CHAIN_HEIGHT else 0)
 +
 +            for t in THREADS:
 +                for type in ['Fast', 'Slow']:
 +                    if type == 'Fast':
-+                        self.restart_node(i, ['-blockfilterindex=1', f'-walletpar={t}'])
++                        self.restart_node(0, ['-blockfilterindex=1', f'-walletpar={t}'])
 +                    else:
-+                        self.restart_node(i, ['-blockfilterindex=0', f'-walletpar={t}'])
++                        self.restart_node(0, ['-blockfilterindex=0', f'-walletpar={t}'])
 +
-+                    node.loadwallet('rescan_benchmark')
-+                    wallet = node.get_wallet_rpc('rescan_benchmark')
++                    node.loadwallet(wallet_name)
++                    wallet = node.get_wallet_rpc(wallet_name)
 +                    self.log.info(f"Running {type} rescan with {t} thread(s) for interval {interval}")
-+                    min_time, max_time, avg_time = self.benchmark(wallet)
++                    min_time, max_time, avg_time = self.benchmark(wallet, CHAIN_LENGTH)
++                    self.assert_payments_received(wallet, interval_addresses[interval], interval)
 +                    results.append((type, t, interval, min_time, max_time, avg_time))
 +                    self.log.info(f"{type} Rescan Results for interval {interval} with {t} threads(s): min={min_time}ns, max={max_time}ns, avg={avg_time}ns")
 +
