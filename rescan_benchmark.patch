@@ -18,7 +18,7 @@ index 0000000000..368918437e
 +
 +CHAIN_LENGTH = 5000
 +KEYPOOL_SIZE = 10
-+INTERVALS = [0, 5, 500, CHAIN_LENGTH+1] # For interval CHAIN_LENGTH+1, there will be no payments in the chain
++INTERVALS = [0, 5, 10, 50, 100, 500, CHAIN_LENGTH+1] # For interval CHAIN_LENGTH+1, there will be no payments in the chain
 +THREADS = [1, 2, 4, 8, 16]
 +
 +# Blocks are announced/submitted to the node in batches over p2p.
