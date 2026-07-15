@@ -1,11 +1,12 @@
 diff --git a/test/functional/rescan_benchmark.py b/test/functional/rescan_benchmark.py
 new file mode 100755
-index 0000000000..049044b1f3
+index 0000000000..368918437e
 --- /dev/null
 +++ b/test/functional/rescan_benchmark.py
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,203 @@
 +#!/usr/bin/env python3
 +
++from collections import defaultdict
 +from test_framework.address import address_to_scriptpubkey
 +from test_framework.blocktools import create_block, create_coinbase
 +from test_framework.messages import CBlockHeader, CTxOut, msg_block, msg_headers
@@ -15,12 +16,16 @@ index 0000000000..049044b1f3
 +
 +import time
 +
-+CHAIN_LENGTH = 20000
-+INTERVALS = [0, 5, 500, 1000, 2000, 10000, CHAIN_LENGTH+1] # For interval CHAIN_LENGTH+1, there will be no payments in the chain
++CHAIN_LENGTH = 5000
++KEYPOOL_SIZE = 10
++INTERVALS = [0, 5, 500, CHAIN_LENGTH+1] # For interval CHAIN_LENGTH+1, there will be no payments in the chain
 +THREADS = [1, 2, 4, 8, 16]
 +
 +# Blocks are announced/submitted to the node in batches over p2p.
 +BATCH_SIZE = 2000
++
++# Number of keypool-sized groups to derive per deriveaddresses RPC call.
++DERIVE_STEP_SIZE = 5
 +
 +class BaseNode(P2PInterface):
 +    def send_header_for_blocks(self, new_blocks):
@@ -31,6 +36,8 @@ index 0000000000..049044b1f3
 +class RescanBenchmark(BitcoinTestFramework):
 +    def add_options(self, parser):
 +        parser.add_argument('--output_file', dest='output_file', default='', help='File to write benchmark results to')
++        parser.add_argument('--worstcase', action='store_true', default=False,
++                            help='Pay to end-of-range addresses so every payment triggers a top-up (default: pay sequentially, top-up every KEYPOOL_SIZE payments)')
 +
 +    def set_test_params(self):
 +        self.num_nodes = 1
@@ -62,28 +69,26 @@ index 0000000000..049044b1f3
 +    def payment_step(self, interval: int) -> int:
 +        return interval if interval > 0 else 1
 +
-+    ### Number of payments an interval's address should have received in the built chain
++    ### Number of payments an interval's descriptor should have received in the built chain
 +    def expected_payment_count(self, interval: int) -> int:
 +        return CHAIN_LENGTH // self.payment_step(interval) if interval <= CHAIN_LENGTH else 0
 +
 +    ### Asserts the wallet has recorded exactly the expected number of payments for the interval
-+    def assert_payments_received(self, wallet, address, interval):
++    def assert_payments_received(self, wallet, interval):
 +        expected = self.expected_payment_count(interval)
-+        # include_immature_coinbase=True since the payments are coinbase outputs and most
-+        # of the chain is still within COINBASE_MATURITY of the tip.
-+        received = wallet.listreceivedbyaddress(0, True, False, address, True)
-+        actual = len(received[0]['txids']) if received else 0
-+        assert_equal(actual, expected)
++        txs = wallet.listtransactions('*', 1000000)
++        # Payments are extra coinbase outputs, so category is 'generate' (mature) or
++        # 'immature' — not 'receive'. Exclude 'send' to count only incoming payments.
++        received = [tx for tx in txs if tx['category'] != 'send']
++        assert_equal(len(received), expected)
 +
-+    ### Builds a single chain of blocks in-process, where each interval's address is paid
-+    ### (via an extra zero-value coinbase output) every `interval` blocks.
-+    def build_chain(self, tip, block_time, interval_scripts):
++    ### Builds a single chain of blocks in-process, paying the pre-computed scripts at each height.
++    def build_chain(self, tip, block_time, scripts_for_height):
 +        blocks = []
 +        for height in range(1, CHAIN_LENGTH + 1):
 +            coinbase = create_coinbase(height)
-+            for interval, script in interval_scripts.items():
-+                if interval <= CHAIN_LENGTH and height % self.payment_step(interval) == 0:
-+                    coinbase.vout.append(CTxOut(0, script))
++            for script in scripts_for_height.get(height, []):
++                coinbase.vout.append(CTxOut(0, script))
 +            block = create_block(tip, coinbase, ntime=block_time)
 +            block.solve()
 +            blocks.append(block)
@@ -103,45 +108,70 @@ index 0000000000..049044b1f3
 +
 +    def run_test(self):
 +        node = self.nodes[0]
-+        self.restart_node(0, ['-blockfilterindex=1'])
++        self.restart_node(0, ['-blockfilterindex=1', f'-keypool={KEYPOOL_SIZE}'])
 +
-+        node.createwallet(wallet_name='keys')
-+        keys = node.get_wallet_rpc('keys')
-+        interval_addresses = {}
 +        interval_descriptors = {}
++        scripts_for_height = defaultdict(list)
++
++        self.log.info("Creating interval wallets and pre-computing payment addresses")
 +        for interval in INTERVALS:
-+            address = keys.getnewaddress()
-+            interval_addresses[interval] = address
-+            interval_descriptors[interval] = keys.getaddressinfo(address)['desc']
-+        interval_scripts = {interval: address_to_scriptpubkey(address) for interval, address in interval_addresses.items()}
++            wallet_name = f'keys_{interval}'
++            node.createwallet(wallet_name=wallet_name)
++            w = node.get_wallet_rpc(wallet_name)
++
++            # Use the external (non-internal) ranged descriptor for this interval's payments.
++            descs = w.listdescriptors()['descriptors']
++            external_desc = next(d for d in descs if 'range' in d and not d.get('internal'))
++            interval_descriptors[interval] = external_desc['desc']
++
++            payment_count = self.expected_payment_count(interval)
++            step = self.payment_step(interval)
++
++            if self.options.worstcase:
++                # Payment k goes to index k*KEYPOOL_SIZE - 1 (end of the k-th keypool range),
++                # so every payment triggers a top-up during rescan.
++                for chunk_start in range(0, payment_count, DERIVE_STEP_SIZE):
++                    chunk_end = min(chunk_start + DERIVE_STEP_SIZE, payment_count)
++                    # Derive several multiples of KEYPOOL_SIZE addresses (DERIVE_STEP_SIZE)
++                    # so we can obtain multiple end of range addresses at once  
++                    addrs = w.deriveaddresses(external_desc['desc'], [chunk_start * KEYPOOL_SIZE, chunk_end * KEYPOOL_SIZE - 1])
++                    for i in range(0, chunk_end - chunk_start):
++                        payment_num = i + chunk_start + 1
++                        height = payment_num * step
++                        scripts_for_height[height].append(address_to_scriptpubkey(addrs[(i + 1) * KEYPOOL_SIZE - 1]))
++            else:
++                # Payment k goes to the next sequential index (k-1, 0-indexed).
++                # A top-up is triggered once every KEYPOOL_SIZE payments instead of every payment.
++                sequential_chunk = DERIVE_STEP_SIZE * KEYPOOL_SIZE
++                for chunk_start in range(0, payment_count, sequential_chunk):
++                    chunk_end = min(chunk_start + sequential_chunk, payment_count)
++                    addrs = w.deriveaddresses(external_desc['desc'], [chunk_start, chunk_end - 1])
++                    for i in range(0, chunk_end - chunk_start):
++                        payment_num = i + chunk_start + 1
++                        height = payment_num * step
++                        scripts_for_height[height].append(address_to_scriptpubkey(addrs[i]))
++
++            node.unloadwallet(wallet_name)
 +
 +        self.log.info("Building chain blocks in-process")
 +        tip = int(node.getbestblockhash(), 16)
 +        block_time = node.getblock(node.getbestblockhash())['time'] + 1
-+        blocks = self.build_chain(tip, block_time, interval_scripts)
++        blocks = self.build_chain(tip, block_time, scripts_for_height)
 +
-+        self.log.info("Submitting chain to the node over p2p")
-+        self.submit_chain(node, blocks)
-+        assert_equal(node.getblockcount(), CHAIN_LENGTH)
-+
-+        # Blocks submitted over p2p aren't picked up by the wallet's live notifications,
-+        # so rescan explicitly to check the chain was built correctly.
-+        keys.rescanblockchain(0, CHAIN_LENGTH)
-+        for interval, address in interval_addresses.items():
-+            self.assert_payments_received(keys, address, interval)
-+
-+        node.unloadwallet('keys')
-+
-+        # Create one watch-only wallet per interval, each holding only that interval's key.
 +        for interval in INTERVALS:
 +            wallet_name = f'rescan_{interval}'
 +            node.createwallet(wallet_name=wallet_name, disable_private_keys=True, blank=True, descriptors=True)
 +            import_result = node.get_wallet_rpc(wallet_name).importdescriptors([{
 +                'desc': interval_descriptors[interval],
 +                'timestamp': 'now',
++                'range': [0, KEYPOOL_SIZE - 1],
 +            }])
 +            assert_equal(import_result[0]['success'], True)
 +            node.unloadwallet(wallet_name)
++
++        self.log.info("Submitting chain to the node over p2p")
++        self.submit_chain(node, blocks)
++        assert_equal(node.getblockcount(), CHAIN_LENGTH)
 +
 +        results = []
 +        for interval in INTERVALS:
@@ -149,27 +179,27 @@ index 0000000000..049044b1f3
 +            self.log.info(f"Benchmarking rescanblockchain with interval {interval}")
 +
 +            for t in THREADS:
-+                for type in ['Fast', 'Slow']:
-+                    if type == 'Fast':
-+                        self.restart_node(0, ['-blockfilterindex=1', f'-walletpar={t}'])
++                for scan_type in ['Fast', 'Slow']:
++                    if scan_type == 'Fast':
++                        self.restart_node(0, ['-blockfilterindex=1', f'-walletpar={t}', f'-keypool={KEYPOOL_SIZE}'])
 +                    else:
-+                        self.restart_node(0, ['-blockfilterindex=0', f'-walletpar={t}'])
++                        self.restart_node(0, ['-blockfilterindex=0', f'-walletpar={t}', f'-keypool={KEYPOOL_SIZE}'])
 +
 +                    node.loadwallet(wallet_name)
 +                    wallet = node.get_wallet_rpc(wallet_name)
-+                    self.log.info(f"Running {type} rescan with {t} thread(s) for interval {interval}")
++                    self.log.info(f"Running {scan_type} rescan with {t} thread(s) for interval {interval}")
 +                    min_time, max_time, avg_time = self.benchmark(wallet, CHAIN_LENGTH)
-+                    self.assert_payments_received(wallet, interval_addresses[interval], interval)
-+                    results.append((type, t, interval, min_time, max_time, avg_time))
-+                    self.log.info(f"{type} Rescan Results for interval {interval} with {t} threads(s): min={min_time}ns, max={max_time}ns, avg={avg_time}ns")
++                    self.assert_payments_received(wallet, interval)
++                    results.append((scan_type, t, interval, min_time, max_time, avg_time))
++                    self.log.info(f"{scan_type} Rescan Results for interval {interval} with {t} threads(s): min={min_time}ns, max={max_time}ns, avg={avg_time}ns")
 +
 +        # Write to output file specified in args
 +        output_file = self.options.output_file
 +        if output_file:
 +            with open(output_file, 'w') as f:
 +                f.write("Type,Threads,Interval,Min Time (us),Max Time (us),Avg Time (us)\n")
-+                for type, t, interval, min_time, max_time, avg_time in results:
-+                    f.write(f"{type},{t},{interval},{min_time // 1000},{max_time // 1000},{avg_time // 1000}\n")
++                for scan_type, t, interval, min_time, max_time, avg_time in results:
++                    f.write(f"{scan_type},{t},{interval},{min_time // 1000},{max_time // 1000},{avg_time // 1000}\n")
 +            self.log.info(f"Benchmark results written to {output_file}")
 +        else:
 +            self.log.info("No output file specified, skipping write.")

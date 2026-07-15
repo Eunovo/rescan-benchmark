@@ -51,6 +51,7 @@ for COMMIT in "$@"; do
     # Get short commit hash
     COMMIT_HASH=$(git rev-parse --short "$COMMIT")
     OUTPUT_FILE="$ORIGINAL_DIR/${COMMIT_HASH}.csv"
+    WORSTCASE_OUTPUT_FILE="$ORIGINAL_DIR/worstcase.${COMMIT_HASH}.csv"
 
     # Checkout the commit
     git checkout "$COMMIT"
@@ -87,6 +88,14 @@ for COMMIT in "$@"; do
     if ./build/test/functional/rescan_benchmark.py --timeout-factor 8 --output_file="$OUTPUT_FILE"; then
         echo "Benchmark completed successfully for $COMMIT"
         echo "Results saved to $OUTPUT_FILE"
+    else
+        echo "Error: Benchmark failed for $COMMIT"
+    fi
+
+    echo "Running worstcase benchmark..."
+    if ./build/test/functional/rescan_benchmark.py --timeout-factor 8 --output_file="$WORSTCASE_OUTPUT_FILE" --worstcase; then
+        echo "Benchmark completed successfully for $COMMIT"
+        echo "Results saved to $WORSTCASE_OUTPUT_FILE"
     else
         echo "Error: Benchmark failed for $COMMIT"
     fi
