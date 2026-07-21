@@ -1,9 +1,9 @@
 diff --git a/test/functional/rescan_benchmark.py b/test/functional/rescan_benchmark.py
 new file mode 100755
-index 0000000000..368918437e
+index 0000000000..2723a1c295
 --- /dev/null
 +++ b/test/functional/rescan_benchmark.py
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,207 @@
 +#!/usr/bin/env python3
 +
 +from collections import defaultdict
@@ -16,8 +16,8 @@ index 0000000000..368918437e
 +
 +import time
 +
-+CHAIN_LENGTH = 5000
-+KEYPOOL_SIZE = 10
++CHAIN_LENGTH = 2000
++KEYPOOL_SIZE = 100
 +INTERVALS = [0, 5, 10, 50, 100, 500, CHAIN_LENGTH+1] # For interval CHAIN_LENGTH+1, there will be no payments in the chain
 +THREADS = [1, 2, 4, 8, 16]
 +
@@ -46,16 +46,31 @@ index 0000000000..368918437e
 +    def skip_test_if_missing_module(self):
 +        self.skip_if_no_wallet()
 +
-+    ### Returns (min, max, avg)
-+    def benchmark(self, wallet, stop_height, iters: int = 3) -> (int, int, int):
++    ### Returns (min, max, avg). Each iteration gets a fresh cold wallet, since a wallet that
++    ### already scanned the chain would have its keypool topped up and its transactions
++    ### recorded, defeating both the top-up measurement (--worstcase) and the point of rescanning.
++    def benchmark(self, node, interval, stop_height, wallet_prefix, iters: int = 3) -> (int, int, int):
 +        min_time = float('inf')
 +        max_time = 0
 +        total_time = 0
 +
-+        for _ in range(iters):
++        for i in range(iters):
++            wallet_name = f'{wallet_prefix}_{i}'
++            node.createwallet(wallet_name=wallet_name, disable_private_keys=True, blank=True, descriptors=True)
++            wallet = node.get_wallet_rpc(wallet_name)
++            assert_equal(wallet.getwalletinfo()['txcount'], 0)
++
 +            start_time = time.perf_counter_ns()
-+            wallet.rescanblockchain(0, stop_height)
++            import_result = wallet.importdescriptors([{
++                'desc': self.interval_descriptors[interval],
++                'timestamp': 0,
++                'range': [0, KEYPOOL_SIZE - 1],
++            }])
 +            end_time = time.perf_counter_ns()
++
++            assert_equal(import_result[0]['success'], True)
++            self.assert_payments_received(wallet, interval)
++            node.unloadwallet(wallet_name)
 +
 +            elapsed = end_time - start_time
 +            min_time = min(min_time, elapsed)
@@ -110,7 +125,7 @@ index 0000000000..368918437e
 +        node = self.nodes[0]
 +        self.restart_node(0, ['-blockfilterindex=1', f'-keypool={KEYPOOL_SIZE}'])
 +
-+        interval_descriptors = {}
++        self.interval_descriptors = {}
 +        scripts_for_height = defaultdict(list)
 +
 +        self.log.info("Creating interval wallets and pre-computing payment addresses")
@@ -122,7 +137,7 @@ index 0000000000..368918437e
 +            # Use the external (non-internal) ranged descriptor for this interval's payments.
 +            descs = w.listdescriptors()['descriptors']
 +            external_desc = next(d for d in descs if 'range' in d and not d.get('internal'))
-+            interval_descriptors[interval] = external_desc['desc']
++            self.interval_descriptors[interval] = external_desc['desc']
 +
 +            payment_count = self.expected_payment_count(interval)
 +            step = self.payment_step(interval)
@@ -133,7 +148,7 @@ index 0000000000..368918437e
 +                for chunk_start in range(0, payment_count, DERIVE_STEP_SIZE):
 +                    chunk_end = min(chunk_start + DERIVE_STEP_SIZE, payment_count)
 +                    # Derive several multiples of KEYPOOL_SIZE addresses (DERIVE_STEP_SIZE)
-+                    # so we can obtain multiple end of range addresses at once  
++                    # so we can obtain multiple end of range addresses at once
 +                    addrs = w.deriveaddresses(external_desc['desc'], [chunk_start * KEYPOOL_SIZE, chunk_end * KEYPOOL_SIZE - 1])
 +                    for i in range(0, chunk_end - chunk_start):
 +                        payment_num = i + chunk_start + 1
@@ -158,40 +173,29 @@ index 0000000000..368918437e
 +        block_time = node.getblock(node.getbestblockhash())['time'] + 1
 +        blocks = self.build_chain(tip, block_time, scripts_for_height)
 +
-+        for interval in INTERVALS:
-+            wallet_name = f'rescan_{interval}'
-+            node.createwallet(wallet_name=wallet_name, disable_private_keys=True, blank=True, descriptors=True)
-+            import_result = node.get_wallet_rpc(wallet_name).importdescriptors([{
-+                'desc': interval_descriptors[interval],
-+                'timestamp': 'now',
-+                'range': [0, KEYPOOL_SIZE - 1],
-+            }])
-+            assert_equal(import_result[0]['success'], True)
-+            node.unloadwallet(wallet_name)
-+
 +        self.log.info("Submitting chain to the node over p2p")
 +        self.submit_chain(node, blocks)
 +        assert_equal(node.getblockcount(), CHAIN_LENGTH)
 +
 +        results = []
 +        for interval in INTERVALS:
-+            wallet_name = f'rescan_{interval}'
 +            self.log.info(f"Benchmarking rescanblockchain with interval {interval}")
 +
-+            for t in THREADS:
-+                for scan_type in ['Fast', 'Slow']:
-+                    if scan_type == 'Fast':
-+                        self.restart_node(0, ['-blockfilterindex=1', f'-walletpar={t}', f'-keypool={KEYPOOL_SIZE}'])
-+                    else:
-+                        self.restart_node(0, ['-blockfilterindex=0', f'-walletpar={t}', f'-keypool={KEYPOOL_SIZE}'])
++            self.restart_node(0, ['-blockfilterindex=0', f'-keypool={KEYPOOL_SIZE}'])
 +
-+                    node.loadwallet(wallet_name)
-+                    wallet = node.get_wallet_rpc(wallet_name)
-+                    self.log.info(f"Running {scan_type} rescan with {t} thread(s) for interval {interval}")
-+                    min_time, max_time, avg_time = self.benchmark(wallet, CHAIN_LENGTH)
-+                    self.assert_payments_received(wallet, interval)
-+                    results.append((scan_type, t, interval, min_time, max_time, avg_time))
-+                    self.log.info(f"{scan_type} Rescan Results for interval {interval} with {t} threads(s): min={min_time}ns, max={max_time}ns, avg={avg_time}ns")
++            self.log.info(f"Running Slow rescan for interval {interval}")
++            wallet_prefix = f'rescan_{interval}_Slow'
++            min_time, max_time, avg_time = self.benchmark(node, interval, CHAIN_LENGTH, wallet_prefix)
++            results.append(("Slow", "N/A", interval, min_time, max_time, avg_time))
++            self.log.info(f"Slow Rescan Results for interval {interval}: min={min_time}ns, max={max_time}ns, avg={avg_time}ns")
++
++            for t in THREADS:
++                self.restart_node(0, ['-blockfilterindex=1', f'-walletpar={t}', f'-keypool={KEYPOOL_SIZE}'])
++                self.log.info(f"Running Fast rescan with {t} thread(s) for interval {interval}")
++                wallet_prefix = f'rescan_{interval}_{t}_Fast'
++                min_time, max_time, avg_time = self.benchmark(node, interval, CHAIN_LENGTH, wallet_prefix)
++                results.append(("Fast", t, interval, min_time, max_time, avg_time))
++                self.log.info(f"Fast Rescan Results for interval {interval} with {t} threads(s): min={min_time}ns, max={max_time}ns, avg={avg_time}ns")
 +
 +        # Write to output file specified in args
 +        output_file = self.options.output_file
