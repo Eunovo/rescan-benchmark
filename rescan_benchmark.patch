@@ -1,9 +1,9 @@
 diff --git a/test/functional/rescan_benchmark.py b/test/functional/rescan_benchmark.py
 new file mode 100755
-index 0000000000..2723a1c295
+index 0000000000..1fec791136
 --- /dev/null
 +++ b/test/functional/rescan_benchmark.py
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,196 @@
 +#!/usr/bin/env python3
 +
 +from collections import defaultdict
@@ -36,8 +36,6 @@ index 0000000000..2723a1c295
 +class RescanBenchmark(BitcoinTestFramework):
 +    def add_options(self, parser):
 +        parser.add_argument('--output_file', dest='output_file', default='', help='File to write benchmark results to')
-+        parser.add_argument('--worstcase', action='store_true', default=False,
-+                            help='Pay to end-of-range addresses so every payment triggers a top-up (default: pay sequentially, top-up every KEYPOOL_SIZE payments)')
 +
 +    def set_test_params(self):
 +        self.num_nodes = 1
@@ -48,7 +46,7 @@ index 0000000000..2723a1c295
 +
 +    ### Returns (min, max, avg). Each iteration gets a fresh cold wallet, since a wallet that
 +    ### already scanned the chain would have its keypool topped up and its transactions
-+    ### recorded, defeating both the top-up measurement (--worstcase) and the point of rescanning.
++    ### recorded, defeating the point of rescanning.
 +    def benchmark(self, node, interval, stop_height, wallet_prefix, iters: int = 3) -> (int, int, int):
 +        min_time = float('inf')
 +        max_time = 0
@@ -142,35 +140,25 @@ index 0000000000..2723a1c295
 +            payment_count = self.expected_payment_count(interval)
 +            step = self.payment_step(interval)
 +
-+            if self.options.worstcase:
-+                # Payment k goes to index k*KEYPOOL_SIZE - 1 (end of the k-th keypool range),
-+                # so every payment triggers a top-up during rescan.
-+                for chunk_start in range(0, payment_count, DERIVE_STEP_SIZE):
-+                    chunk_end = min(chunk_start + DERIVE_STEP_SIZE, payment_count)
-+                    # Derive several multiples of KEYPOOL_SIZE addresses (DERIVE_STEP_SIZE)
-+                    # so we can obtain multiple end of range addresses at once
-+                    addrs = w.deriveaddresses(external_desc['desc'], [chunk_start * KEYPOOL_SIZE, chunk_end * KEYPOOL_SIZE - 1])
-+                    for i in range(0, chunk_end - chunk_start):
-+                        payment_num = i + chunk_start + 1
-+                        height = payment_num * step
-+                        scripts_for_height[height].append(address_to_scriptpubkey(addrs[(i + 1) * KEYPOOL_SIZE - 1]))
-+            else:
-+                # Payment k goes to the next sequential index (k-1, 0-indexed).
-+                # A top-up is triggered once every KEYPOOL_SIZE payments instead of every payment.
-+                sequential_chunk = DERIVE_STEP_SIZE * KEYPOOL_SIZE
-+                for chunk_start in range(0, payment_count, sequential_chunk):
-+                    chunk_end = min(chunk_start + sequential_chunk, payment_count)
-+                    addrs = w.deriveaddresses(external_desc['desc'], [chunk_start, chunk_end - 1])
-+                    for i in range(0, chunk_end - chunk_start):
-+                        payment_num = i + chunk_start + 1
-+                        height = payment_num * step
-+                        scripts_for_height[height].append(address_to_scriptpubkey(addrs[i]))
++            # Payment k goes to the next sequential index (k-1, 0-indexed). The keypool is
++            # kept KEYPOOL_SIZE keys ahead of the last used index, so every payment triggers
++            # a top-up that derives one new script.
++            sequential_chunk = DERIVE_STEP_SIZE * KEYPOOL_SIZE
++            for chunk_start in range(0, payment_count, sequential_chunk):
++                chunk_end = min(chunk_start + sequential_chunk, payment_count)
++                addrs = w.deriveaddresses(external_desc['desc'], [chunk_start, chunk_end - 1])
++                for i in range(0, chunk_end - chunk_start):
++                    payment_num = i + chunk_start + 1
++                    height = payment_num * step
++                    scripts_for_height[height].append(address_to_scriptpubkey(addrs[i]))
 +
 +            node.unloadwallet(wallet_name)
 +
 +        self.log.info("Building chain blocks in-process")
 +        tip = int(node.getbestblockhash(), 16)
-+        block_time = node.getblock(node.getbestblockhash())['time'] + 1
++        # Recent timestamps so the node leaves IBD once it has the chain;
++        # rescans don't check filters in parallel during IBD.
++        block_time = int(time.time()) - CHAIN_LENGTH
 +        blocks = self.build_chain(tip, block_time, scripts_for_height)
 +
 +        self.log.info("Submitting chain to the node over p2p")
@@ -191,6 +179,7 @@ index 0000000000..2723a1c295
 +
 +            for t in THREADS:
 +                self.restart_node(0, ['-blockfilterindex=1', f'-walletpar={t}', f'-keypool={KEYPOOL_SIZE}'])
++                assert_equal(node.getblockchaininfo()['initialblockdownload'], False)
 +                self.log.info(f"Running Fast rescan with {t} thread(s) for interval {interval}")
 +                wallet_prefix = f'rescan_{interval}_{t}_Fast'
 +                min_time, max_time, avg_time = self.benchmark(node, interval, CHAIN_LENGTH, wallet_prefix)
